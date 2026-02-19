@@ -12,6 +12,35 @@ MODULE_DESCRIPTION("A simple FS kernel module");
 
 #define LOG(fmt, ...) pr_info("[" MODULE_NAME "]: " fmt, ##__VA_ARGS__)
 
+struct dentry* vtfs_lookup(
+  struct inode* parent_inode,  // родительская нода
+  struct dentry* child_dentry, // объект, к которому мы пытаемся получить доступ
+  unsigned int flag            // неиспользуемое значение
+) {
+  return 0;
+}
+
+struct inode_operations vtfs_inode_ops = {
+  .lookup = vtfs_lookup,
+};
+
+static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
+{
+    if (!dir_emit_dots(filp, ctx))
+        return 0;
+
+    if (ctx->pos == 2) {
+        if (!dir_emit(ctx, "test.txt", strlen("test.txt"), 101, DT_REG))
+            return 0;
+        ctx->pos++;
+    }
+    return 0;
+}
+
+struct file_operations vtfs_dir_ops = {
+  .iterate = vtfs_iterate,
+};
+
 void vtfs_kill_sb(struct super_block* sb) {
   printk(KERN_INFO "vtfs super block is destroyed. Unmount successfully.\n");
 }
@@ -26,13 +55,15 @@ struct inode* vtfs_get_inode(
   if (inode != NULL) {
     inode_init_owner(inode, dir, mode);
   }
-
+  inode->i_op = &vtfs_inode_ops;
+  if (S_ISDIR(inode->i_mode))
+    inode->i_fop = &vtfs_dir_ops;
   inode->i_ino = i_ino;
   return inode;
 }
 
 int vtfs_fill_super(struct super_block *sb, void *data, int silent) {
-  struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR, 1000);
+  struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, 1000);
 
   sb->s_root = d_make_root(inode);
   if (sb->s_root == NULL) {
