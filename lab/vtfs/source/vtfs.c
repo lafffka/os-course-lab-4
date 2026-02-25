@@ -5,6 +5,7 @@
 #include <linux/kernel.h>  // printk, pr_info
 #include <linux/slab.h>    // kmalloc, kfree
 #include <linux/uaccess.h> // copy_to_user, copy_from_user
+#include <linux/list.h>
 
 #define MODULE_NAME "vtfs"
 
@@ -33,6 +34,8 @@ typedef struct vtfs_node {
 	char *data;                 // file content (NULL for dirs)
 	size_t data_size;
 	unsigned int nlink;
+	bool destroying;
+	struct list_head destroy_link;
 
 	vtfs_child_t children[MAX_CHILDREN];
 	int child_count;
@@ -114,7 +117,9 @@ static vtfs_node_t *vtfs_fs_init_root(void)
 	root->mode = S_IFDIR | 0777;
 	root->data = NULL;
 	root->data_size = 0;
-	root->nlink = 1;
+	root->nlink = 2;
+	root->destroying = false;
+	INIT_LIST_HEAD(&root->destroy_link);
 
 	root->child_count = 0;
 	root->parent = NULL;
@@ -152,7 +157,9 @@ static vtfs_node_t *vtfs_fs_create_node(vtfs_node_t *parent,
 	node->mode = mode;
 	node->data = NULL;
 	node->data_size = 0;
-	node->nlink = 1;
+	node->nlink = S_ISDIR(mode) ? 2 : 1;
+	node->destroying = false;
+	INIT_LIST_HEAD(&node->destroy_link);
 
 	node->child_count = 0;
 	node->parent = parent;
@@ -180,7 +187,7 @@ static int vtfs_fs_delete_node(vtfs_node_t *parent, const char *name)
 
 			parent->child_count--;
 
-			node->nlink--;
+			// node->nlink -= S_ISDIR(node->mode) ? 2 : 1;
 			if (node->nlink == 0) {
 				kfree(node->data);
 				kfree(node);
@@ -193,23 +200,35 @@ static int vtfs_fs_delete_node(vtfs_node_t *parent, const char *name)
 	return -ENOENT;
 }
 
-static void vtfs_fs_destroy(vtfs_node_t *node)
+static void vtfs_fs_destroy_collect(vtfs_node_t *node, struct list_head *lst)
 {
 	int i;
 
-	if (!node)
+	if (!node || node->destroying)
 		return;
+
+	node->destroying = true;
+	list_add(&node->destroy_link, lst);
 
 	for (i = 0; i < node->child_count; i++)
-		vtfs_fs_destroy(node->children[i].node);
+		vtfs_fs_destroy_collect(node->children[i].node, lst);
+}
 
-	if (node->nlink > 1) {
-		node->nlink--;
+static void vtfs_fs_destroy(vtfs_node_t *root)
+{
+	LIST_HEAD(lst);
+	vtfs_node_t *node, *tmp;
+
+	if (!root)
 		return;
-	}
+	
+	vtfs_fs_destroy_collect(root, &lst);
 
-	kfree(node->data);
-	kfree(node);
+	list_for_each_entry_safe(node, tmp, &lst, destroy_link) {
+		list_del(&node->destroy_link);
+		kfree(node->data);
+		kfree(node);
+	}
 }
 
 /* ============================================================================
@@ -262,16 +281,21 @@ static int vtfs_create(struct inode *parent_inode,
 static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry)
 {
 	vtfs_node_t *parent;
+	vtfs_node_t *node;
 	int err;
 
 	parent = parent_inode->i_private;
+	node = vtfs_fs_lookup(parent, child_dentry->d_name.name);
+
+	if (!node)
+		return -ENOENT;
+
+	node->nlink--;
+	set_nlink(child_dentry->d_inode, node->nlink);	
+	
 	err = vtfs_fs_delete_node(parent, child_dentry->d_name.name);
-	if (err)
-		return err;
-	
-	drop_nlink(child_dentry->d_inode);
-	
-	return 0;	
+
+	return err;	
 }
 
 static struct dentry *vtfs_lookup(struct inode *parent_inode,
@@ -336,11 +360,11 @@ static int vtfs_mkdir(struct inode *parent_inode,
 
     inode = vtfs_get_inode(parent_inode->i_sb, parent_inode, S_IFDIR | 0777, new_node);
     if (!inode)
-        return -ENOMEM;
+		return -ENOMEM;
 
-    inc_nlink(inode);
-    inc_nlink(parent_inode);
-
+	parent->nlink++;
+    set_nlink(inode, new_node->nlink);
+	set_nlink(parent_inode, parent->nlink);
     d_instantiate(child_dentry, inode);
     return 0;
 }
@@ -357,11 +381,13 @@ static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry)
         return -ENOENT;
 
     if (node->child_count > 0)
-        return -ENOTEMPTY;
+		return -ENOTEMPTY;
 	
-    drop_nlink(child_dentry->d_inode);   // undo the "." link
-    drop_nlink(child_dentry->d_inode);   // undo the entry in parent
-    drop_nlink(parent_inode);            // undo the ".." back-reference
+	node->nlink -=2;	// remove "." and entry in parent	
+	parent->nlink--;	// remove ".."
+    
+	set_nlink(child_dentry->d_inode, node->nlink);
+	set_nlink(parent_inode, parent->nlink);
 
     return vtfs_fs_delete_node(parent, child_dentry->d_name.name);
 }
@@ -447,7 +473,7 @@ static int vtfs_link(struct dentry *old_dentry,
 	new_parent->child_count++;
 
     node->nlink++;
-    inc_nlink(inode);
+    set_nlink(inode, node->nlink);
     ihold(inode);
 	d_drop(new_dentry);
 	d_add(new_dentry, inode);
@@ -480,17 +506,14 @@ static struct inode *vtfs_get_inode(struct super_block *sb,
 		inode->i_private = node;
 		inode->i_ino = node->ino;
 		inode->i_op = &vtfs_inode_ops;
-
-		if (S_ISDIR(inode->i_mode))
-			inode->i_fop = &vtfs_dir_ops;
-		else
-			inode->i_fop = &vtfs_file_ops;
-
+		inode->i_fop = S_ISDIR(mode) ? &vtfs_dir_ops : &vtfs_file_ops;
+        
 		inode->i_size = node->data_size;
-        set_nlink(inode, node->nlink);
-        unlock_new_inode(inode);
+		set_nlink(inode, node->nlink);
+		
+		unlock_new_inode(inode);
 	}
-
+	
 	return inode;
 }
 
