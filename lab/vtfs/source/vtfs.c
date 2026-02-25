@@ -22,14 +22,19 @@ MODULE_DESCRIPTION("A simple FS kernel module");
  * In-memory tree node
  * ==========================================================================*/
 
+typedef struct vtfs_child {
+    char name[MAX_NAME_LEN];
+    struct vtfs_node *node;
+} vtfs_child_t;
+
 typedef struct vtfs_node {
 	ino_t ino;
-	char name[MAX_NAME_LEN];
 	umode_t mode;               // S_IFREG or S_IFDIR (+ perms)
 	char *data;                 // file content (NULL for dirs)
 	size_t data_size;
+	unsigned int nlink;
 
-	struct vtfs_node *children[MAX_CHILDREN];
+	vtfs_child_t children[MAX_CHILDREN];
 	int child_count;
 
 	struct vtfs_node *parent;
@@ -75,6 +80,10 @@ static ssize_t vtfs_write(struct file *filp,
                           size_t len,
                           loff_t *offset);
 
+static int vtfs_link(struct dentry *old_dentry,
+                     struct inode *parent_dir,
+                     struct dentry *new_dentry);
+
 static int vtfs_fill_super(struct super_block *sb, void *data, int silent);
 
 static struct dentry *vtfs_mount(struct file_system_type *fs_type,
@@ -101,11 +110,11 @@ static vtfs_node_t *vtfs_fs_init_root(void)
 		return NULL;
 
 	root->ino = 1000;
-	strcpy(root->name, "/");
 
 	root->mode = S_IFDIR | 0777;
 	root->data = NULL;
 	root->data_size = 0;
+	root->nlink = 1;
 
 	root->child_count = 0;
 	root->parent = NULL;
@@ -118,8 +127,8 @@ static vtfs_node_t *vtfs_fs_lookup(vtfs_node_t *parent, const char *name)
 	int i;
 
 	for (i = 0; i < parent->child_count; i++) {
-		if (!strcmp(parent->children[i]->name, name))
-			return parent->children[i];
+		if (!strcmp(parent->children[i].name, name))
+			return parent->children[i].node;
 	}
 
 	return NULL;
@@ -140,34 +149,43 @@ static vtfs_node_t *vtfs_fs_create_node(vtfs_node_t *parent,
 
 	node->ino = atomic_inc_return(&next_ino);
 
-	strncpy(node->name, name, MAX_NAME_LEN - 1);
-	node->name[MAX_NAME_LEN - 1] = '\0';
-
 	node->mode = mode;
 	node->data = NULL;
 	node->data_size = 0;
+	node->nlink = 1;
 
 	node->child_count = 0;
 	node->parent = parent;
 
-	parent->children[parent->child_count++] = node;
+	strncpy(parent->children[parent->child_count].name, name, MAX_NAME_LEN - 1);
+    parent->children[parent->child_count].name[MAX_NAME_LEN - 1] = '\0';
+    parent->children[parent->child_count].node = node;
+    parent->child_count++;
+
 	return node;
 }
 
 static int vtfs_fs_delete_node(vtfs_node_t *parent, const char *name)
 {
 	int i;
+	vtfs_node_t *node;
 
 	for (i = 0; i < parent->child_count; i++) {
-		if (!strcmp(parent->children[i]->name, name)) {
-			kfree(parent->children[i]->data);
-			kfree(parent->children[i]);
+		if (!strcmp(parent->children[i].name, name)) {
+			node = parent->children[i].node;
 
 			/* Shift remaining children left */
 			for (; i < parent->child_count - 1; i++)
 				parent->children[i] = parent->children[i + 1];
 
 			parent->child_count--;
+
+			node->nlink--;
+			if (node->nlink == 0) {
+				kfree(node->data);
+				kfree(node);
+			}
+
 			return 0;
 		}
 	}
@@ -183,7 +201,7 @@ static void vtfs_fs_destroy(vtfs_node_t *node)
 		return;
 
 	for (i = 0; i < node->child_count; i++)
-		vtfs_fs_destroy(node->children[i]);
+		vtfs_fs_destroy(node->children[i].node);
 
 	kfree(node->data);
 	kfree(node);
@@ -199,6 +217,7 @@ static const struct inode_operations vtfs_inode_ops = {
 	.lookup = vtfs_lookup,
 	.mkdir	= vtfs_mkdir,
 	.rmdir	= vtfs_rmdir,
+	.link	= vtfs_link,
 };
 
 static const struct file_operations vtfs_file_ops = {
@@ -237,8 +256,17 @@ static int vtfs_create(struct inode *parent_inode,
 
 static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry)
 {
-	vtfs_node_t *parent = parent_inode->i_private;
-	return vtfs_fs_delete_node(parent, child_dentry->d_name.name);
+	vtfs_node_t *parent;
+	int err;
+
+	parent = parent_inode->i_private;
+	err = vtfs_fs_delete_node(parent, child_dentry->d_name.name);
+	if (err)
+		return err;
+	
+	drop_nlink(child_dentry->d_inode);
+	
+	return 0;	
 }
 
 static struct dentry *vtfs_lookup(struct inode *parent_inode,
@@ -272,10 +300,10 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
 
 	i = (int)ctx->pos - 2;
 	while (i < dir->child_count) {
-		vtfs_node_t *child = dir->children[i];
-		unsigned char ftype = S_ISDIR(child->mode) ? DT_DIR : DT_REG;
+		vtfs_child_t child = dir->children[i];
+		unsigned char ftype = S_ISDIR(child.node->mode) ? DT_DIR : DT_REG;
 
-		if (!dir_emit(ctx, child->name, strlen(child->name), child->ino, ftype))
+		if (!dir_emit(ctx, child.name, strlen(child.name), child.node->ino, ftype))
 			return 0;
 
 		ctx->pos++;
@@ -387,6 +415,38 @@ static ssize_t vtfs_write(struct file *filp,
     filp->f_path.dentry->d_inode->i_size = new_size;
 
     return len;
+}
+
+static int vtfs_link(struct dentry *old_dentry,
+                     struct inode *parent_dir,
+                     struct dentry *new_dentry)
+{
+    struct inode *inode;
+    vtfs_node_t  *node;
+    vtfs_node_t  *new_parent;
+
+	inode = old_dentry->d_inode;
+	node = inode->i_private;
+	new_parent = parent_dir->i_private;
+
+    if (S_ISDIR(inode->i_mode))
+        return -EPERM;
+
+    if (new_parent->child_count >= MAX_CHILDREN)
+        return -ENOSPC;
+
+    strncpy(new_parent->children[new_parent->child_count].name, 
+			new_dentry->d_name.name, MAX_NAME_LEN - 1);
+    new_parent->children[new_parent->child_count].name[MAX_NAME_LEN - 1] = '\0';
+    new_parent->children[new_parent->child_count].node = node;
+	new_parent->child_count++;
+
+    node->nlink++;
+    inc_nlink(inode);
+    ihold(inode);
+    d_instantiate(new_dentry, inode);
+
+    return 0;
 }
 
 /* ============================================================================
