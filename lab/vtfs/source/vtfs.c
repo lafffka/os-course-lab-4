@@ -470,20 +470,26 @@ static struct inode *vtfs_get_inode(struct super_block *sb,
                                     umode_t mode,
                                     vtfs_node_t *node)
 {
-	struct inode *inode = new_inode(sb);
+	struct inode *inode = iget_locked(sb, node->ino);
 	if (!inode)
 		return NULL;
 
-	inode_init_owner(inode, dir, mode);
+	if (inode->i_state & I_NEW) {
+		inode_init_owner(inode, dir, mode);
 
-	inode->i_private = node;
-	inode->i_ino = node->ino;
-	inode->i_op = &vtfs_inode_ops;
+		inode->i_private = node;
+		inode->i_ino = node->ino;
+		inode->i_op = &vtfs_inode_ops;
 
-	if (S_ISDIR(inode->i_mode))
-		inode->i_fop = &vtfs_dir_ops;
-	else
-		inode->i_fop = &vtfs_file_ops;
+		if (S_ISDIR(inode->i_mode))
+			inode->i_fop = &vtfs_dir_ops;
+		else
+			inode->i_fop = &vtfs_file_ops;
+
+		inode->i_size = node->data_size;
+        set_nlink(inode, node->nlink);
+        unlock_new_inode(inode);
+	}
 
 	return inode;
 }
