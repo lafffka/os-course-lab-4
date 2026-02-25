@@ -4,6 +4,7 @@
 #include <linux/mount.h>   // mount_nodev, kill_anon_super
 #include <linux/kernel.h>  // printk, pr_info
 #include <linux/slab.h>    // kmalloc, kfree
+#include <linux/uaccess.h> // copy_to_user, copy_from_user
 
 #define MODULE_NAME "vtfs"
 
@@ -63,6 +64,16 @@ static int vtfs_mkdir(struct inode *parent_inode,
 
 static int vtfs_rmdir(struct inode *parent_inode,
                       struct dentry *child_dentry);
+
+static ssize_t vtfs_read(struct file *filp,
+                         char __user *buffer,
+                         size_t len,
+                         loff_t *offset);
+
+static ssize_t vtfs_write(struct file *filp,
+                          const char __user *buffer,
+                          size_t len,
+                          loff_t *offset);
 
 static int vtfs_fill_super(struct super_block *sb, void *data, int silent);
 
@@ -190,6 +201,15 @@ static const struct inode_operations vtfs_inode_ops = {
 	.rmdir	= vtfs_rmdir,
 };
 
+static const struct file_operations vtfs_file_ops = {
+    .read  	= vtfs_read,
+    .write	= vtfs_write,
+};
+
+static const struct file_operations vtfs_dir_ops = {
+	.iterate = vtfs_iterate,
+};
+
 static int vtfs_create(struct inode *parent_inode,
                        struct dentry *child_dentry,
                        umode_t mode,
@@ -313,9 +333,61 @@ static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry)
     return vtfs_fs_delete_node(parent, child_dentry->d_name.name);
 }
 
-static const struct file_operations vtfs_dir_ops = {
-	.iterate = vtfs_iterate,
-};
+static ssize_t vtfs_read(struct file *filp,
+                         char __user *buffer,
+                         size_t len,
+                         loff_t *offset)
+{
+    vtfs_node_t *node;
+    ssize_t remaining;
+
+	node = filp->f_path.dentry->d_inode->i_private;
+
+    if (*offset >= node->data_size)
+        return 0;
+
+    remaining = node->data_size - *offset;
+    if (len > remaining)
+        len = remaining;
+
+    if (copy_to_user(buffer, node->data + *offset, len))
+        return -EFAULT;
+
+    *offset += len;
+    return len;
+}
+
+static ssize_t vtfs_write(struct file *filp,
+                          const char __user *buffer,
+                          size_t len,
+                          loff_t *offset)
+{
+    vtfs_node_t *node;
+    size_t new_size;
+    char *new_data;
+
+	node = filp->f_path.dentry->d_inode->i_private;
+	new_size = *offset + len;
+
+    if (new_size > MAX_FILE_SIZE)
+        return -ENOSPC;
+
+    new_data = krealloc(node->data, new_size, GFP_KERNEL);
+    if (!new_data)
+        return -ENOMEM;
+
+    node->data = new_data;
+
+    if (copy_from_user(node->data + *offset, buffer, len))
+        return -EFAULT;
+
+    node->data_size = new_size;
+    *offset += len;
+
+    filp->f_path.dentry->d_inode->i_size = new_size;
+
+    return len;
+}
 
 /* ============================================================================
  * Superblock / mount
@@ -344,6 +416,8 @@ static struct inode *vtfs_get_inode(struct super_block *sb,
 
 	if (S_ISDIR(inode->i_mode))
 		inode->i_fop = &vtfs_dir_ops;
+	else
+		inode->i_fop = &vtfs_file_ops;
 
 	return inode;
 }
