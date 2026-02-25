@@ -14,7 +14,7 @@
 #define MAX_FILE_SIZE 4096
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("secs-dev");
+MODULE_AUTHOR("timohaaaaa");
 MODULE_DESCRIPTION("A simple FS kernel module");
 
 #define LOG(fmt, ...) pr_info("[" MODULE_NAME "]: " fmt, ##__VA_ARGS__)
