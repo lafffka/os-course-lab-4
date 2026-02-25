@@ -255,7 +255,7 @@ static int vtfs_create(struct inode *parent_inode,
 	if (!inode)
 		return -ENOMEM;
 
-	d_add(child_dentry, inode);
+	d_instantiate(child_dentry, inode);
 	return 0;
 }
 
