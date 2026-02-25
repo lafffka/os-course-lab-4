@@ -57,6 +57,13 @@ static struct dentry *vtfs_lookup(struct inode *parent_inode,
 
 static int vtfs_iterate(struct file *filp, struct dir_context *ctx);
 
+static int vtfs_mkdir(struct inode *parent_inode,
+                      struct dentry *child_dentry,
+                      umode_t mode);
+
+static int vtfs_rmdir(struct inode *parent_inode,
+                      struct dentry *child_dentry);
+
 static int vtfs_fill_super(struct super_block *sb, void *data, int silent);
 
 static struct dentry *vtfs_mount(struct file_system_type *fs_type,
@@ -179,6 +186,8 @@ static const struct inode_operations vtfs_inode_ops = {
 	.create = vtfs_create,
 	.unlink = vtfs_unlink,
 	.lookup = vtfs_lookup,
+	.mkdir	= vtfs_mkdir,
+	.rmdir	= vtfs_rmdir,
 };
 
 static int vtfs_create(struct inode *parent_inode,
@@ -194,7 +203,6 @@ static int vtfs_create(struct inode *parent_inode,
 	parent = parent_inode->i_private;
 	name = child_dentry->d_name.name;
 
-	/* For now always create a regular file with 0777 (same as your original) */
 	new_node = vtfs_fs_create_node(parent, name, S_IFREG | 0777);
 	if (!new_node)
 		return -ENOMEM;
@@ -255,6 +263,54 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
 	}
 
 	return 0;
+}
+
+static int vtfs_mkdir(struct inode *parent_inode,
+                      struct dentry *child_dentry,
+                      umode_t mode)
+{
+    vtfs_node_t *parent;
+    const char  *name;
+    vtfs_node_t *new_node;
+    struct inode *inode;
+
+    parent = parent_inode->i_private;
+    name = child_dentry->d_name.name;
+
+    new_node = vtfs_fs_create_node(parent, name, S_IFDIR | 0777);
+    if (!new_node)
+        return -ENOMEM;
+
+    inode = vtfs_get_inode(parent_inode->i_sb, parent_inode, S_IFDIR | 0777, new_node);
+    if (!inode)
+        return -ENOMEM;
+
+    inc_nlink(inode);
+    inc_nlink(parent_inode);
+
+    d_instantiate(child_dentry, inode);
+    return 0;
+}
+
+static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry)
+{
+    vtfs_node_t *parent;
+    vtfs_node_t *node;
+
+    parent = parent_inode->i_private;
+    node = vtfs_fs_lookup(parent, child_dentry->d_name.name);
+    
+    if (!node)
+        return -ENOENT;
+
+    if (node->child_count > 0)
+        return -ENOTEMPTY;
+	
+    drop_nlink(child_dentry->d_inode);   // undo the "." link
+    drop_nlink(child_dentry->d_inode);   // undo the entry in parent
+    drop_nlink(parent_inode);            // undo the ".." back-reference
+
+    return vtfs_fs_delete_node(parent, child_dentry->d_name.name);
 }
 
 static const struct file_operations vtfs_dir_ops = {
