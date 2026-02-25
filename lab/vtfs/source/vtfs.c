@@ -203,6 +203,11 @@ static void vtfs_fs_destroy(vtfs_node_t *node)
 	for (i = 0; i < node->child_count; i++)
 		vtfs_fs_destroy(node->children[i].node);
 
+	if (node->nlink > 1) {
+		node->nlink--;
+		return;
+	}
+
 	kfree(node->data);
 	kfree(node);
 }
@@ -444,7 +449,8 @@ static int vtfs_link(struct dentry *old_dentry,
     node->nlink++;
     inc_nlink(inode);
     ihold(inode);
-    d_instantiate(new_dentry, inode);
+	d_drop(new_dentry);
+	d_add(new_dentry, inode);
 
     return 0;
 }
