@@ -507,8 +507,11 @@ static int vtfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, root_node);
 	sb->s_root = d_make_root(inode);
-	if (!sb->s_root)
+	if (!sb->s_root) {
+		vtfs_fs_destroy(root_node);
+		sb->s_fs_info = NULL;
 		return -ENOMEM;
+	}
 
 	return 0;
 }
